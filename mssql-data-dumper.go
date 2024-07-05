@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/xuri/excelize/v2"
 )
+
+var verbose bool
 
 func main() {
 	// Define command-line flags
@@ -19,6 +20,7 @@ func main() {
 	user := flag.String("user", "", "Database username")
 	password := flag.String("password", "", "Database password")
 	database := flag.String("database", "", "Database name")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
 
 	// Parse the flags
 	flag.Parse()
@@ -54,7 +56,9 @@ func main() {
 	rowCount := 0
 	for rows.Next() {
 		rowCount++
-		fmt.Printf("Processing row %d from trak_data_dumper_data...\n", rowCount)
+		if verbose {
+			fmt.Printf("Processing row %d from trak_data_dumper_data...\n", rowCount)
+		}
 
 		var trackerModule, trackerSlug string
 		err := rows.Scan(&trackerModule, &trackerSlug)
@@ -64,26 +68,64 @@ func main() {
 		}
 
 		// Search tracker table
-		fmt.Printf("Searching tracker table for module '%s' and slug '%s'...\n", trackerModule, trackerSlug)
-		var datatable string
-		err = db.QueryRow("SELECT datatable FROM tracker WHERE module = ? AND slug = ?", trackerModule, trackerSlug).Scan(&datatable)
+		if verbose {
+			fmt.Printf("Searching tracker table for module '%s' and slug '%s'...\n", trackerModule, trackerSlug)
+		}
+		var trackerId int
+		var datatable, excelfields, listfields sql.NullString
+		err = db.QueryRow("SELECT id, datatable, excelfields, listfields FROM tracker WHERE module = ? AND slug = ?", trackerModule, trackerSlug).Scan(&trackerId, &datatable, &excelfields, &listfields)
 		if err != nil && err != sql.ErrNoRows {
 			log.Printf("Error querying tracker table for row %d: %v\n", rowCount, err)
 			continue
 		}
 
 		var tableName string
-		if err == sql.ErrNoRows || datatable == "" {
+		if err == sql.ErrNoRows || !datatable.Valid || datatable.String == "" {
 			tableName = "trak_" + trackerSlug + "_data"
-			fmt.Printf("No matching entry found in tracker table. Using table name: %s\n", tableName)
+			if verbose {
+				fmt.Printf("No matching entry found in tracker table or datatable is NULL/empty. Using table name: %s\n", tableName)
+			}
 		} else {
-			tableName = datatable
-			fmt.Printf("Matching entry found in tracker table. Using table name: %s\n", tableName)
+			tableName = datatable.String
+			if verbose {
+				fmt.Printf("Matching entry found in tracker table. Using table name: %s\n", tableName)
+			}
+		}
+
+		// Check if the table exists
+		if !tableExists(db, tableName) {
+			log.Printf("Table '%s' does not exist. Skipping...\n", tableName)
+			continue
+		}
+
+		// Get the columns to be dumped
+		var columnsToExport []string
+		if excelfields.Valid && excelfields.String != "" {
+			columnsToExport = strings.Split(excelfields.String, ",")
+		} else if listfields.Valid && listfields.String != "" {
+			columnsToExport = strings.Split(listfields.String, ",")
+		}
+
+		if len(columnsToExport) == 0 {
+			log.Printf("No columns specified for export in table '%s'. Skipping...\n", tableName)
+			continue
+		}
+
+		// Validate columns against tracker_field table and get field types
+		validColumns, fieldTypes, err := validateColumnsAndGetTypes(db, trackerId, columnsToExport)
+		if err != nil {
+			log.Printf("Error validating columns for table '%s': %v\n", tableName, err)
+			continue
+		}
+
+		if len(validColumns) == 0 {
+			log.Printf("No valid columns found for export in table '%s'. Skipping...\n", tableName)
+			continue
 		}
 
 		// Dump data to Excel
 		fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-		if err := dumpToExcel(db, tableName); err != nil {
+		if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes); err != nil {
 			log.Printf("Error dumping data to Excel for table '%s': %v\n", tableName, err)
 		} else {
 			fmt.Printf("Successfully dumped data from table '%s' to Excel.\n", tableName)
@@ -93,45 +135,95 @@ func main() {
 	fmt.Println("Data dumping process completed.")
 }
 
-func dumpToExcel(db *sql.DB, tableName string) error {
-	// Query all data from the table
-	fmt.Printf("Querying all data from table '%s'...\n", tableName)
-	rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s", tableName))
+func tableExists(db *sql.DB, tableName string) bool {
+	query := `
+		SELECT COUNT(*) 
+		FROM INFORMATION_SCHEMA.TABLES 
+		WHERE TABLE_NAME = ?
+	`
+	var count int
+	err := db.QueryRow(query, tableName).Scan(&count)
+	if err != nil {
+		log.Printf("Error checking if table exists: %v\n", err)
+		return false
+	}
+	return count > 0
+}
+
+func validateColumnsAndGetTypes(db *sql.DB, trackerId int, columns []string) ([]string, map[string]string, error) {
+	var validColumns []string
+	fieldTypes := make(map[string]string)
+	for _, col := range columns {
+		col = strings.TrimSpace(col)
+		var count int
+		var fieldType string
+		err := db.QueryRow("SELECT COUNT(*), field_type FROM tracker_field WHERE tracker_id = ? AND name = ? GROUP BY field_type", trackerId, col).Scan(&count, &fieldType)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, nil, fmt.Errorf("error validating column %s: %v", col, err)
+		}
+		if count > 0 {
+			validColumns = append(validColumns, col)
+			fieldTypes[col] = fieldType
+		}
+	}
+	return validColumns, fieldTypes, nil
+}
+
+func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string) error {
+	// Prepare the query
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
+	if verbose {
+		fmt.Printf("Executing query: %s\n", query)
+	}
+	rows, err := db.Query(query)
 	if err != nil {
 		return fmt.Errorf("error querying table %s: %v", tableName, err)
 	}
 	defer rows.Close()
 
-	// Get column names
-	columns, err := rows.Columns()
-	if err != nil {
-		return fmt.Errorf("error getting column names: %v", err)
+	// Get column labels from tracker_field table
+	columnLabels := make(map[string]string)
+	for _, col := range columns {
+		var label string
+		err := db.QueryRow("SELECT label FROM tracker_field WHERE tracker_id = ? AND name = ?", trackerId, col).Scan(&label)
+		if err == nil {
+			columnLabels[col] = label
+		} else if err != sql.ErrNoRows {
+			fmt.Printf("Error querying tracker_field for column %s: %v\n", col, err)
+		}
 	}
-	fmt.Printf("Retrieved %d columns from table '%s'.\n", len(columns), tableName)
 
 	// Create a new Excel file
-	fmt.Println("Creating new Excel file...")
 	f := excelize.NewFile()
 	defer f.Close()
 
 	// Set column headers
-	fmt.Println("Setting column headers in Excel...")
 	for i, col := range columns {
 		cell := fmt.Sprintf("%c1", 'A'+i)
-		f.SetCellValue("Sheet1", cell, col)
+		label, exists := columnLabels[col]
+		if exists {
+			f.SetCellValue("Sheet1", cell, label)
+		} else {
+			f.SetCellValue("Sheet1", cell, col)
+		}
 	}
 
-	// Write data to Excel
-	fmt.Println("Writing data to Excel...")
-	rowIndex := 2
-	rowCount := 0
-	startTime := time.Now()
-	for rows.Next() {
-		rowCount++
-		if rowCount%1000 == 0 {
-			fmt.Printf("Processed %d rows...\n", rowCount)
-		}
+	// Prepare statements for User and Branch lookups
+	userStmt, err := db.Prepare("SELECT emp_name FROM IAP_User WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("error preparing user statement: %v", err)
+	}
+	defer userStmt.Close()
 
+	branchStmt, err := db.Prepare("SELECT Branch_Name FROM Branch_Listing WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("error preparing branch statement: %v", err)
+	}
+	defer branchStmt.Close()
+
+	// Write data to Excel
+	rowIndex := 2
+	for rows.Next() {
 		// Create a slice of interface{} to hold the row data
 		rowData := make([]interface{}, len(columns))
 		rowPointers := make([]interface{}, len(columns))
@@ -144,19 +236,42 @@ func dumpToExcel(db *sql.DB, tableName string) error {
 			return fmt.Errorf("error scanning row: %v", err)
 		}
 
-		// Write the row data to Excel
-		for i, val := range rowData {
+		// Process and write the row data to Excel
+		for i, col := range columns {
 			cell := fmt.Sprintf("%c%d", 'A'+i, rowIndex)
-			f.SetCellValue("Sheet1", cell, val)
+			value := rowData[i]
+
+			// Handle User and Branch field types
+			switch fieldTypes[col] {
+			case "User":
+				if id, ok := value.(int64); ok {
+					var empName string
+					err := userStmt.QueryRow(id).Scan(&empName)
+					if err == nil {
+						value = empName
+					} else if err != sql.ErrNoRows {
+						fmt.Printf("Error looking up user name for ID %d: %v\n", id, err)
+					}
+				}
+			case "Branch":
+				if id, ok := value.(int64); ok {
+					var branchName string
+					err := branchStmt.QueryRow(id).Scan(&branchName)
+					if err == nil {
+						value = branchName
+					} else if err != sql.ErrNoRows {
+						fmt.Printf("Error looking up branch name for ID %d: %v\n", id, err)
+					}
+				}
+			}
+
+			f.SetCellValue("Sheet1", cell, value)
 		}
 		rowIndex++
 	}
-	duration := time.Since(startTime)
-	fmt.Printf("Finished writing %d rows to Excel. Time taken: %v\n", rowCount, duration)
 
 	// Save the Excel file
 	filename := strings.ReplaceAll(tableName, " ", "_") + ".xlsx"
-	fmt.Printf("Saving Excel file as '%s'...\n", filename)
 	if err := f.SaveAs(filename); err != nil {
 		return fmt.Errorf("error saving Excel file: %v", err)
 	}
