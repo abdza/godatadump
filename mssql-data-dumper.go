@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/xuri/excelize/v2"
@@ -14,12 +15,15 @@ import (
 var verbose bool
 
 func main() {
+	startTime := time.Now()
+
 	// Define command-line flags
 	server := flag.String("server", "", "Database server address")
 	port := flag.Int("port", 1433, "Database server port")
 	user := flag.String("user", "", "Database username")
 	password := flag.String("password", "", "Database password")
 	database := flag.String("database", "", "Database name")
+	datadumpID := flag.Int("datadump_id", 0, "Specific datadump ID to process (optional)")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
 
 	// Parse the flags
@@ -45,9 +49,16 @@ func main() {
 	defer db.Close()
 	fmt.Println("Connected successfully.")
 
-	// Query trak_data_dumper_data table with updated column names
-	fmt.Println("Querying trak_data_dumper_data table...")
-	rows, err := db.Query("SELECT tracker_module, tracker_slug FROM trak_data_dumper_data")
+	// Prepare the query based on whether a specific datadump_id was provided
+	var rows *sql.Rows
+	if *datadumpID > 0 {
+		fmt.Printf("Processing specific datadump ID: %d\n", *datadumpID)
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
+	} else {
+		fmt.Println("Processing all datadump records...")
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug FROM trak_data_dumper_data")
+	}
+
 	if err != nil {
 		log.Fatal("Error querying trak_data_dumper_data:", err)
 	}
@@ -60,8 +71,9 @@ func main() {
 			fmt.Printf("Processing row %d from trak_data_dumper_data...\n", rowCount)
 		}
 
+		var datadumpID int
 		var trackerModule, trackerSlug string
-		err := rows.Scan(&trackerModule, &trackerSlug)
+		err := rows.Scan(&datadumpID, &trackerModule, &trackerSlug)
 		if err != nil {
 			log.Printf("Error scanning row %d: %v\n", rowCount, err)
 			continue
@@ -100,11 +112,22 @@ func main() {
 
 		// Get the columns to be dumped
 		var columnsToExport []string
+		var columnSource string
 		if excelfields.Valid && excelfields.String != "" {
 			columnsToExport = strings.Split(excelfields.String, ",")
+			columnSource = "excelfields"
+			fmt.Printf("Columns determined by excelfields: %s\n", excelfields.String)
 		} else if listfields.Valid && listfields.String != "" {
 			columnsToExport = strings.Split(listfields.String, ",")
+			columnSource = "listfields"
+			fmt.Printf("Columns determined by listfields: %s\n", listfields.String)
+		} else {
+			fmt.Printf("No columns specified for export in table '%s'. Skipping...\n", tableName)
+			continue
 		}
+
+		fmt.Printf("Column source: %s\n", columnSource)
+		fmt.Printf("Columns to export: %v\n", columnsToExport)
 
 		if len(columnsToExport) == 0 {
 			log.Printf("No columns specified for export in table '%s'. Skipping...\n", tableName)
@@ -123,9 +146,11 @@ func main() {
 			continue
 		}
 
+		fmt.Printf("Valid columns after validation: %v\n", validColumns)
+
 		// Dump data to Excel
 		fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-		if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes); err != nil {
+		if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, trackerModule, trackerSlug); err != nil {
 			log.Printf("Error dumping data to Excel for table '%s': %v\n", tableName, err)
 		} else {
 			fmt.Printf("Successfully dumped data from table '%s' to Excel.\n", tableName)
@@ -133,6 +158,9 @@ func main() {
 	}
 
 	fmt.Println("Data dumping process completed.")
+
+	elapsedTime := time.Since(startTime)
+	fmt.Printf("Total execution time: %s\n", elapsedTime)
 }
 
 func tableExists(db *sql.DB, tableName string) bool {
@@ -169,7 +197,7 @@ func validateColumnsAndGetTypes(db *sql.DB, trackerId int, columns []string) ([]
 	return validColumns, fieldTypes, nil
 }
 
-func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string) error {
+func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, module, slug string) error {
 	// Prepare the query
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
 	if verbose {
@@ -270,8 +298,8 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 		rowIndex++
 	}
 
-	// Save the Excel file
-	filename := strings.ReplaceAll(tableName, " ", "_") + ".xlsx"
+	// Save the Excel file with the new naming convention
+	filename := fmt.Sprintf("%s_%s.xlsx", module, slug)
 	if err := f.SaveAs(filename); err != nil {
 		return fmt.Errorf("error saving Excel file: %v", err)
 	}
