@@ -6,13 +6,25 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/xuri/excelize/v2"
 )
 
-var verbose bool
+var (
+	verbose    bool
+	maxWorkers int
+	maxDBConns int
+	batchSize  int
+)
+
+type DumpTask struct {
+	DatadumpID    int
+	TrackerModule string
+	TrackerSlug   string
+}
 
 func main() {
 	startTime := time.Now()
@@ -25,6 +37,9 @@ func main() {
 	database := flag.String("database", "", "Database name")
 	datadumpID := flag.Int("datadump_id", 0, "Specific datadump ID to process (optional)")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
+	flag.IntVar(&maxWorkers, "max_workers", 5, "Maximum number of concurrent workers")
+	flag.IntVar(&maxDBConns, "max_db_conns", 10, "Maximum number of database connections")
+	flag.IntVar(&batchSize, "batch_size", 5000, "Number of rows to process in each batch")
 
 	// Parse the flags
 	flag.Parse()
@@ -40,14 +55,30 @@ func main() {
 	connString := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;database=%s",
 		*server, *port, *user, *password, *database)
 
-	// Connect to the database
-	fmt.Printf("Connecting to database %s on server %s...\n", *database, *server)
+	// Create a connection pool
 	db, err := sql.Open("mssql", connString)
 	if err != nil {
-		log.Fatal("Error connecting to the database:", err)
+		log.Fatal("Error creating database pool:", err)
 	}
 	defer db.Close()
-	fmt.Println("Connected successfully.")
+
+	// Set maximum number of open connections
+	db.SetMaxOpenConns(maxDBConns)
+	db.SetMaxIdleConns(maxDBConns)
+
+	fmt.Printf("Connected successfully. Max workers: %d, Max DB connections: %d, Batch size: %d\n", maxWorkers, maxDBConns, batchSize)
+
+	// Create a channel for tasks
+	taskChan := make(chan DumpTask, maxWorkers)
+
+	// Create a wait group to wait for all workers to finish
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go worker(db, taskChan, &wg)
+	}
 
 	// Prepare the query based on whether a specific datadump_id was provided
 	var rows *sql.Rows
@@ -64,103 +95,118 @@ func main() {
 	}
 	defer rows.Close()
 
-	rowCount := 0
+	// Enqueue tasks
 	for rows.Next() {
-		rowCount++
-		if verbose {
-			fmt.Printf("Processing row %d from trak_data_dumper_data...\n", rowCount)
-		}
-
-		var datadumpID int
-		var trackerModule, trackerSlug string
-		err := rows.Scan(&datadumpID, &trackerModule, &trackerSlug)
+		var task DumpTask
+		err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug)
 		if err != nil {
-			log.Printf("Error scanning row %d: %v\n", rowCount, err)
+			log.Printf("Error scanning row: %v\n", err)
 			continue
 		}
-
-		// Search tracker table
-		if verbose {
-			fmt.Printf("Searching tracker table for module '%s' and slug '%s'...\n", trackerModule, trackerSlug)
-		}
-		var trackerId int
-		var datatable, excelfields, listfields sql.NullString
-		err = db.QueryRow("SELECT id, datatable, excelfields, listfields FROM tracker WHERE module = ? AND slug = ?", trackerModule, trackerSlug).Scan(&trackerId, &datatable, &excelfields, &listfields)
-		if err != nil && err != sql.ErrNoRows {
-			log.Printf("Error querying tracker table for row %d: %v\n", rowCount, err)
-			continue
-		}
-
-		var tableName string
-		if err == sql.ErrNoRows || !datatable.Valid || datatable.String == "" {
-			tableName = "trak_" + trackerSlug + "_data"
-			if verbose {
-				fmt.Printf("No matching entry found in tracker table or datatable is NULL/empty. Using table name: %s\n", tableName)
-			}
-		} else {
-			tableName = datatable.String
-			if verbose {
-				fmt.Printf("Matching entry found in tracker table. Using table name: %s\n", tableName)
-			}
-		}
-
-		// Check if the table exists
-		if !tableExists(db, tableName) {
-			log.Printf("Table '%s' does not exist. Skipping...\n", tableName)
-			continue
-		}
-
-		// Get the columns to be dumped
-		var columnsToExport []string
-		var columnSource string
-		if excelfields.Valid && excelfields.String != "" {
-			columnsToExport = strings.Split(excelfields.String, ",")
-			columnSource = "excelfields"
-			fmt.Printf("Columns determined by excelfields: %s\n", excelfields.String)
-		} else if listfields.Valid && listfields.String != "" {
-			columnsToExport = strings.Split(listfields.String, ",")
-			columnSource = "listfields"
-			fmt.Printf("Columns determined by listfields: %s\n", listfields.String)
-		} else {
-			fmt.Printf("No columns specified for export in table '%s'. Skipping...\n", tableName)
-			continue
-		}
-
-		fmt.Printf("Column source: %s\n", columnSource)
-		fmt.Printf("Columns to export: %v\n", columnsToExport)
-
-		if len(columnsToExport) == 0 {
-			log.Printf("No columns specified for export in table '%s'. Skipping...\n", tableName)
-			continue
-		}
-
-		// Validate columns against tracker_field table and get field types
-		validColumns, fieldTypes, err := validateColumnsAndGetTypes(db, trackerId, columnsToExport)
-		if err != nil {
-			log.Printf("Error validating columns for table '%s': %v\n", tableName, err)
-			continue
-		}
-
-		if len(validColumns) == 0 {
-			log.Printf("No valid columns found for export in table '%s'. Skipping...\n", tableName)
-			continue
-		}
-
-		fmt.Printf("Valid columns after validation: %v\n", validColumns)
-
-		// Dump data to Excel
-		fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-		if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, trackerModule, trackerSlug); err != nil {
-			log.Printf("Error dumping data to Excel for table '%s': %v\n", tableName, err)
-		} else {
-			fmt.Printf("Successfully dumped data from table '%s' to Excel.\n", tableName)
-		}
+		taskChan <- task
 	}
+
+	// Close the task channel
+	close(taskChan)
+
+	// Wait for all workers to finish
+	wg.Wait()
 
 	fmt.Println("Data dumping process completed.")
 
 	elapsedTime := time.Since(startTime)
 	fmt.Printf("Total execution time: %s\n", elapsedTime)
+}
+
+func worker(db *sql.DB, taskChan <-chan DumpTask, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for task := range taskChan {
+		if verbose {
+			fmt.Printf("Processing datadump ID: %d\n", task.DatadumpID)
+		}
+
+		err := processTask(db, task)
+		if err != nil {
+			log.Printf("Error processing task for datadump ID %d: %v\n", task.DatadumpID, err)
+		}
+	}
+}
+
+func processTask(db *sql.DB, task DumpTask) error {
+	// Search tracker table
+	if verbose {
+		fmt.Printf("Searching tracker table for module '%s' and slug '%s'...\n", task.TrackerModule, task.TrackerSlug)
+	}
+	var trackerId int
+	var datatable, excelfields, listfields sql.NullString
+	err := db.QueryRow("SELECT id, datatable, excelfields, listfields FROM tracker WHERE module = ? AND slug = ?", task.TrackerModule, task.TrackerSlug).Scan(&trackerId, &datatable, &excelfields, &listfields)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("error querying tracker table: %v", err)
+	}
+
+	var tableName string
+	if err == sql.ErrNoRows || !datatable.Valid || datatable.String == "" {
+		tableName = "trak_" + task.TrackerSlug + "_data"
+		if verbose {
+			fmt.Printf("No matching entry found in tracker table or datatable is NULL/empty. Using table name: %s\n", tableName)
+		}
+	} else {
+		tableName = datatable.String
+		if verbose {
+			fmt.Printf("Matching entry found in tracker table. Using table name: %s\n", tableName)
+		}
+	}
+
+	// Check if the table exists
+	if !tableExists(db, tableName) {
+		return fmt.Errorf("table '%s' does not exist", tableName)
+	}
+
+	// Get the columns to be dumped
+	var columnsToExport []string
+	var columnSource string
+	if excelfields.Valid && excelfields.String != "" {
+		columnsToExport = strings.Split(excelfields.String, ",")
+		columnSource = "excelfields"
+	} else if listfields.Valid && listfields.String != "" {
+		columnsToExport = strings.Split(listfields.String, ",")
+		columnSource = "listfields"
+	} else {
+		return fmt.Errorf("no columns specified for export in table '%s'", tableName)
+	}
+
+	if verbose {
+		fmt.Printf("Column source: %s\n", columnSource)
+		fmt.Printf("Columns to export: %v\n", columnsToExport)
+	}
+
+	if len(columnsToExport) == 0 {
+		return fmt.Errorf("no columns specified for export in table '%s'", tableName)
+	}
+
+	// Validate columns against tracker_field table and get field types
+	validColumns, fieldTypes, err := validateColumnsAndGetTypes(db, trackerId, columnsToExport)
+	if err != nil {
+		return fmt.Errorf("error validating columns for table '%s': %v", tableName, err)
+	}
+
+	if len(validColumns) == 0 {
+		return fmt.Errorf("no valid columns found for export in table '%s'", tableName)
+	}
+
+	if verbose {
+		fmt.Printf("Valid columns after validation: %v\n", validColumns)
+	}
+
+	// Dump data to Excel
+	fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
+	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, task.TrackerModule, task.TrackerSlug); err != nil {
+		return fmt.Errorf("error dumping data to Excel for table '%s': %v", tableName, err)
+	}
+
+	fmt.Printf("Successfully dumped data from table '%s' to Excel.\n", tableName)
+	return nil
 }
 
 func tableExists(db *sql.DB, tableName string) bool {
@@ -208,45 +254,22 @@ func getExcelColumnName(index int) string {
 }
 
 func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, module, slug string) error {
-	// Prepare the query
-	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
-	if verbose {
-		fmt.Printf("Executing query: %s\n", query)
-	}
-	rows, err := db.Query(query)
-	if err != nil {
-		return fmt.Errorf("error querying table %s: %v", tableName, err)
-	}
-	defer rows.Close()
-
-  fmt.Printf("Columns to dump: %v\n", columns)
-
-	// Get column labels from tracker_field table
-	columnLabels := make(map[string]string)
-	for _, col := range columns {
-		var label string
-		err := db.QueryRow("SELECT label FROM tracker_field WHERE tracker_id = ? AND name = ?", trackerId, col).Scan(&label)
-		if err == nil {
-			columnLabels[col] = label
-		} else if err != sql.ErrNoRows {
-			fmt.Printf("Error querying tracker_field for column %s: %v\n", col, err)
-		}
-	}
-
 	// Create a new Excel file
 	f := excelize.NewFile()
 	defer f.Close()
 
+	// Create a new sheet
+	sheetName := "Sheet1"
+	_, err := f.NewSheet(sheetName)
+	if err != nil {
+		return fmt.Errorf("error creating new sheet: %v", err)
+	}
+
 	// Set column headers
 	for i, col := range columns {
-    cell := fmt.Sprintf("%s1", getExcelColumnName(i+1))
-		label, exists := columnLabels[col]
-		if exists {
-			f.SetCellValue("Sheet1", cell, label)
-		} else {
-			f.SetCellValue("Sheet1", cell, col)
-		}
-    fmt.Printf("Column header %s\n", cell)
+		cell := fmt.Sprintf("%s1", getExcelColumnName(i+1))
+		f.SetCellValue(sheetName, cell, col)
+		fmt.Printf("Column header %s\n", cell)
 	}
 
 	// Prepare statements for User and Branch lookups
@@ -262,53 +285,99 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 	}
 	defer branchStmt.Close()
 
-	// Write data to Excel
+	// Create a streaming writer
+	streamWriter, err := f.NewStreamWriter(sheetName)
+	if err != nil {
+		return fmt.Errorf("error creating stream writer: %v", err)
+	}
+
+	// Prepare the query with OFFSET and FETCH
+	baseQuery := fmt.Sprintf("SELECT %s FROM %s ORDER BY (SELECT NULL) OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", strings.Join(columns, ", "), tableName)
+
+	offset := 0
 	rowIndex := 2
-	for rows.Next() {
-		// Create a slice of interface{} to hold the row data
-		rowData := make([]interface{}, len(columns))
-		rowPointers := make([]interface{}, len(columns))
-		for i := range rowData {
-			rowPointers[i] = &rowData[i]
+	for {
+		// Query for a batch of rows
+		rows, err := db.Query(baseQuery, offset, batchSize)
+		if err != nil {
+			return fmt.Errorf("error querying table %s: %v", tableName, err)
 		}
 
-		// Scan the row into the slice
-		if err := rows.Scan(rowPointers...); err != nil {
-			return fmt.Errorf("error scanning row: %v", err)
-		}
-
-		// Process and write the row data to Excel
-		for i, col := range columns {
-      cell := fmt.Sprintf("%s%d", getExcelColumnName(i+1), rowIndex)
-			value := rowData[i]
-
-			// Handle User and Branch field types
-			switch fieldTypes[col] {
-			case "User":
-				if id, ok := value.(int64); ok {
-					var empName string
-					err := userStmt.QueryRow(id).Scan(&empName)
-					if err == nil {
-						value = empName
-					} else if err != sql.ErrNoRows {
-						fmt.Printf("Error looking up user name for ID %d: %v\n", id, err)
-					}
-				}
-			case "Branch":
-				if id, ok := value.(int64); ok {
-					var branchName string
-					err := branchStmt.QueryRow(id).Scan(&branchName)
-					if err == nil {
-						value = branchName
-					} else if err != sql.ErrNoRows {
-						fmt.Printf("Error looking up branch name for ID %d: %v\n", id, err)
-					}
-				}
+		rowsProcessed := 0
+		for rows.Next() {
+			// Create a slice of interface{} to hold the row data
+			rowData := make([]interface{}, len(columns))
+			rowPointers := make([]interface{}, len(columns))
+			for i := range rowData {
+				rowPointers[i] = &rowData[i]
 			}
 
-			f.SetCellValue("Sheet1", cell, value)
+			// Scan the row into the slice
+			if err := rows.Scan(rowPointers...); err != nil {
+				rows.Close()
+				return fmt.Errorf("error scanning row: %v", err)
+			}
+
+			// Process and write the row data to Excel
+			cellValues := make([]interface{}, len(columns))
+			for i, col := range columns {
+				value := rowData[i]
+
+				// Handle User and Branch field types
+				switch fieldTypes[col] {
+				case "User":
+					if id, ok := value.(int64); ok {
+						var empName string
+						err := userStmt.QueryRow(id).Scan(&empName)
+						if err == nil {
+							value = empName
+						} else if err != sql.ErrNoRows {
+							fmt.Printf("Error looking up user name for ID %d: %v\n", id, err)
+						}
+					}
+				case "Branch":
+					if id, ok := value.(int64); ok {
+						var branchName string
+						err := branchStmt.QueryRow(id).Scan(&branchName)
+						if err == nil {
+							value = branchName
+						} else if err != sql.ErrNoRows {
+							fmt.Printf("Error looking up branch name for ID %d: %v\n", id, err)
+						}
+					}
+				}
+
+				cellValues[i] = value
+			}
+
+			cell, _ := excelize.CoordinatesToCellName(1, rowIndex)
+			if err := streamWriter.SetRow(cell, cellValues); err != nil {
+				rows.Close()
+				return fmt.Errorf("error writing row to Excel: %v", err)
+			}
+
+			rowIndex++
+			rowsProcessed++
 		}
-		rowIndex++
+		rows.Close()
+
+		if rowsProcessed < batchSize {
+			break // We've processed all rows
+		}
+
+		offset += batchSize
+
+		// Flush the stream writer periodically to save memory
+		if offset%50000 == 0 {
+			if err := streamWriter.Flush(); err != nil {
+				return fmt.Errorf("error flushing stream writer: %v", err)
+			}
+		}
+	}
+
+	// Final flush of the stream writer
+	if err := streamWriter.Flush(); err != nil {
+		return fmt.Errorf("error flushing stream writer: %v", err)
 	}
 
 	// Save the Excel file with the new naming convention
