@@ -197,6 +197,16 @@ func validateColumnsAndGetTypes(db *sql.DB, trackerId int, columns []string) ([]
 	return validColumns, fieldTypes, nil
 }
 
+func getExcelColumnName(index int) string {
+	var columnName string
+	for index > 0 {
+		index--
+		columnName = string('A'+index%26) + columnName
+		index = index / 26
+	}
+	return columnName
+}
+
 func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, module, slug string) error {
 	// Prepare the query
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
@@ -208,6 +218,8 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 		return fmt.Errorf("error querying table %s: %v", tableName, err)
 	}
 	defer rows.Close()
+
+  fmt.Printf("Columns to dump: %v\n", columns)
 
 	// Get column labels from tracker_field table
 	columnLabels := make(map[string]string)
@@ -227,13 +239,14 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 
 	// Set column headers
 	for i, col := range columns {
-		cell := fmt.Sprintf("%c1", 'A'+i)
+    cell := fmt.Sprintf("%s1", getExcelColumnName(i+1))
 		label, exists := columnLabels[col]
 		if exists {
 			f.SetCellValue("Sheet1", cell, label)
 		} else {
 			f.SetCellValue("Sheet1", cell, col)
 		}
+    fmt.Printf("Column header %s\n", cell)
 	}
 
 	// Prepare statements for User and Branch lookups
@@ -266,7 +279,7 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 
 		// Process and write the row data to Excel
 		for i, col := range columns {
-			cell := fmt.Sprintf("%c%d", 'A'+i, rowIndex)
+      cell := fmt.Sprintf("%s%d", getExcelColumnName(i+1), rowIndex)
 			value := rowData[i]
 
 			// Handle User and Branch field types
