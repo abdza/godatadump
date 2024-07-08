@@ -24,6 +24,7 @@ type DumpTask struct {
 	DatadumpID    int
 	TrackerModule string
 	TrackerSlug   string
+  TargetFile    string
 }
 
 func main() {
@@ -84,10 +85,10 @@ func main() {
 	var rows *sql.Rows
 	if *datadumpID > 0 {
 		fmt.Printf("Processing specific datadump ID: %d\n", *datadumpID)
-		rows, err = db.Query("SELECT id, tracker_module, tracker_slug FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
 	} else {
 		fmt.Println("Processing all datadump records...")
-		rows, err = db.Query("SELECT id, tracker_module, tracker_slug FROM trak_data_dumper_data")
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file FROM trak_data_dumper_data")
 	}
 
 	if err != nil {
@@ -98,7 +99,7 @@ func main() {
 	// Enqueue tasks
 	for rows.Next() {
 		var task DumpTask
-		err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug)
+    err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug, &task.TargetFile)
 		if err != nil {
 			log.Printf("Error scanning row: %v\n", err)
 			continue
@@ -200,8 +201,8 @@ func processTask(db *sql.DB, task DumpTask) error {
 	}
 
 	// Dump data to Excel
-	fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug); err != nil {
+  fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
+	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug, task.TargetFile); err != nil {
 		return fmt.Errorf("error dumping data to Excel for table '%s': %v", tableName, err)
 	}
 
@@ -291,7 +292,8 @@ func processUserBranchField(value interface{}, stmt *sql.Stmt) interface{} {
 	return fmt.Sprintf("%v", id)
 }
 
-func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug string) error {
+func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string) error {
+
 	// Create a new Excel file
 	f := excelize.NewFile()
 	defer f.Close()
@@ -408,11 +410,17 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 	}
 
 	// Save the Excel file with the new naming convention
-	filename := fmt.Sprintf("%s_%s.xlsx", module, slug)
+  filename := targetFile
+	if filename == "" {
+		// Fallback to the old naming convention if target_file is empty
+		filename = fmt.Sprintf("%s_%s.xlsx", module, slug)
+	}
+
 	if err := f.SaveAs(filename); err != nil {
 		return fmt.Errorf("error saving Excel file: %v", err)
 	}
 
 	fmt.Printf("Data from table '%s' has been successfully exported to '%s'\n", tableName, filename)
 	return nil
+
 }
