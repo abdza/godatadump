@@ -25,6 +25,8 @@ type DumpTask struct {
 	TrackerModule string
 	TrackerSlug   string
   TargetFile    string
+  TableLimit    sql.NullInt64
+	TableSort     sql.NullString
 }
 
 func main() {
@@ -81,14 +83,14 @@ func main() {
 		go worker(db, taskChan, &wg)
 	}
 
-	// Prepare the query based on whether a specific datadump_id was provided
+  // Prepare the query based on whether a specific datadump_id was provided
 	var rows *sql.Rows
 	if *datadumpID > 0 {
 		fmt.Printf("Processing specific datadump ID: %d\n", *datadumpID)
-		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file, table_limit, table_sort FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
 	} else {
 		fmt.Println("Processing all datadump records...")
-		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file FROM trak_data_dumper_data")
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file, table_limit, table_sort FROM trak_data_dumper_data")
 	}
 
 	if err != nil {
@@ -99,7 +101,7 @@ func main() {
 	// Enqueue tasks
 	for rows.Next() {
 		var task DumpTask
-    err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug, &task.TargetFile)
+		err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug, &task.TargetFile, &task.TableLimit, &task.TableSort)
 		if err != nil {
 			log.Printf("Error scanning row: %v\n", err)
 			continue
@@ -119,6 +121,7 @@ func main() {
 	fmt.Printf("Total execution time: %s\n", elapsedTime)
 }
 
+// Update the worker function to fetch TableLimit and TableSort
 func worker(db *sql.DB, taskChan <-chan DumpTask, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -127,7 +130,14 @@ func worker(db *sql.DB, taskChan <-chan DumpTask, wg *sync.WaitGroup) {
 			fmt.Printf("Processing datadump ID: %d\n", task.DatadumpID)
 		}
 
-		err := processTask(db, task)
+		// Fetch TableLimit and TableSort
+		err := db.QueryRow("SELECT table_limit, table_sort FROM trak_data_dumper_data WHERE id = ?", task.DatadumpID).Scan(&task.TableLimit, &task.TableSort)
+		if err != nil && err != sql.ErrNoRows {
+			log.Printf("Error fetching table_limit and table_sort for datadump ID %d: %v\n", task.DatadumpID, err)
+			continue
+		}
+
+		err = processTask(db, task)
 		if err != nil {
 			log.Printf("Error processing task for datadump ID %d: %v\n", task.DatadumpID, err)
 		}
@@ -202,7 +212,7 @@ func processTask(db *sql.DB, task DumpTask) error {
 
 	// Dump data to Excel
   fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug, task.TargetFile); err != nil {
+	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug, task.TargetFile, task.TableLimit, task.TableSort); err != nil {
 		return fmt.Errorf("error dumping data to Excel for table '%s': %v", tableName, err)
 	}
 
@@ -292,7 +302,7 @@ func processUserBranchField(value interface{}, stmt *sql.Stmt) interface{} {
 	return fmt.Sprintf("%v", id)
 }
 
-func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string) error {
+func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string, tableLimit sql.NullInt64, tableSort sql.NullString) error {
 
 	// Create a new Excel file
 	f := excelize.NewFile()
@@ -335,19 +345,44 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 	}
 	defer branchStmt.Close()
 
-	// Prepare the query with OFFSET and FETCH
-	baseQuery := fmt.Sprintf("SELECT %s FROM %s ORDER BY (SELECT NULL) OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", strings.Join(columns, ", "), tableName)
+  // Prepare the query with OFFSET, FETCH, and optional ORDER BY and LIMIT
+	baseQuery := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
+
+  // Add ORDER BY clause if tableSort is provided
+	if tableSort.Valid && tableSort.String != "" {
+		baseQuery += " ORDER BY " + tableSort.String
+	} else {
+		baseQuery += " ORDER BY (SELECT NULL)"
+	}
+
+	// Add OFFSET and FETCH clauses
+	baseQuery += " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
 
 	offset := 0
 	rowIndex := 2
-	for {
+	totalRowsProcessed := 0
+
+  for {
+		// Determine the number of rows to fetch in this batch
+		rowsToFetch := batchSize
+		if tableLimit.Valid {
+			remainingRows := int(tableLimit.Int64) - totalRowsProcessed
+			if remainingRows <= 0 {
+				break // We've reached the table limit
+			}
+			if remainingRows < batchSize {
+				rowsToFetch = remainingRows
+			}
+		}
+
 		// Query for a batch of rows
-		rows, err := db.Query(baseQuery, offset, batchSize)
+		rows, err := db.Query(baseQuery, offset, rowsToFetch)
 		if err != nil {
 			return fmt.Errorf("error querying table %s: %v", tableName, err)
 		}
 
 		rowsProcessed := 0
+
 		for rows.Next() {
 			// Create a slice of interface{} to hold the row data
 			rowData := make([]interface{}, len(columns))
@@ -385,16 +420,23 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 				return fmt.Errorf("error writing row to Excel: %v", err)
 			}
 
-			rowIndex++
+      rowIndex++
 			rowsProcessed++
+			totalRowsProcessed++
+
+			// Check if we've reached the table limit
+			if tableLimit.Valid && totalRowsProcessed >= int(tableLimit.Int64) {
+				rows.Close()
+				break
+			}
 		}
 		rows.Close()
 
-		if rowsProcessed < batchSize {
+		if rowsProcessed < rowsToFetch {
 			break // We've processed all rows
 		}
 
-		offset += batchSize
+		offset += rowsProcessed
 
 		// Flush the stream writer periodically to save memory
 		if offset%50000 == 0 {
