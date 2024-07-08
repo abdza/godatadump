@@ -265,12 +265,22 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 		return fmt.Errorf("error creating new sheet: %v", err)
 	}
 
-	// Set column headers
-	for i, col := range columns {
-		cell := fmt.Sprintf("%s1", getExcelColumnName(i+1))
-		f.SetCellValue(sheetName, cell, col)
-		fmt.Printf("Column header %s\n", cell)
+	// Create a streaming writer
+	streamWriter, err := f.NewStreamWriter(sheetName)
+	if err != nil {
+		return fmt.Errorf("error creating stream writer: %v", err)
 	}
+
+	// Write column headers using the streaming writer
+	fmt.Println("Processing header rows...")
+	headerRow := make([]interface{}, len(columns))
+	for i, col := range columns {
+		headerRow[i] = col
+	}
+	if err := streamWriter.SetRow("A1", headerRow); err != nil {
+		return fmt.Errorf("error writing header row: %v", err)
+	}
+	fmt.Println("Header row processed successfully.")
 
 	// Prepare statements for User and Branch lookups
 	userStmt, err := db.Prepare("SELECT emp_name FROM IAP_User WHERE id = ?")
@@ -284,12 +294,6 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 		return fmt.Errorf("error preparing branch statement: %v", err)
 	}
 	defer branchStmt.Close()
-
-	// Create a streaming writer
-	streamWriter, err := f.NewStreamWriter(sheetName)
-	if err != nil {
-		return fmt.Errorf("error creating stream writer: %v", err)
-	}
 
 	// Prepare the query with OFFSET and FETCH
 	baseQuery := fmt.Sprintf("SELECT %s FROM %s ORDER BY (SELECT NULL) OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", strings.Join(columns, ", "), tableName)
