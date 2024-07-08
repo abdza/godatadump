@@ -256,6 +256,41 @@ func getExcelColumnName(index int) string {
 	return columnName
 }
 
+func processUserBranchField(value interface{}, stmt *sql.Stmt) interface{} {
+	if value == nil {
+		return ""
+	}
+
+	var id interface{}
+	switch v := value.(type) {
+	case int64:
+		id = v
+	case []uint8:
+		id = string(v)
+	case string:
+		id = v
+	default:
+		return fmt.Sprintf("%v", value)
+	}
+
+	if id == "" {
+		return ""
+	}
+
+	var name sql.NullString
+	err := stmt.QueryRow(id).Scan(&name)
+	if err == nil {
+		if name.Valid {
+			return name.String
+		}
+		return "" // Return empty string for NULL values
+	} else if err != sql.ErrNoRows {
+		fmt.Printf("Error looking up name for ID %v: %v\n", id, err)
+	}
+
+	return fmt.Sprintf("%v", id)
+}
+
 func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug string) error {
 	// Create a new Excel file
 	f := excelize.NewFile()
@@ -331,30 +366,15 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 				value := rowData[i]
 
 				// Handle User and Branch field types
-				switch fieldTypes[col] {
-				case "User":
-					if id, ok := value.(int64); ok {
-						var empName string
-						err := userStmt.QueryRow(id).Scan(&empName)
-						if err == nil {
-							value = empName
-						} else if err != sql.ErrNoRows {
-							fmt.Printf("Error looking up user name for ID %d: %v\n", id, err)
-						}
-					}
-				case "Branch":
-					if id, ok := value.(int64); ok {
-						var branchName string
-						err := branchStmt.QueryRow(id).Scan(&branchName)
-						if err == nil {
-							value = branchName
-						} else if err != sql.ErrNoRows {
-							fmt.Printf("Error looking up branch name for ID %d: %v\n", id, err)
-						}
-					}
-				}
+        switch fieldTypes[col] {
+        case "User":
+          cellValues[i] = processUserBranchField(value, userStmt)
+        case "Branch":
+          cellValues[i] = processUserBranchField(value, branchStmt)
+        default:
+          cellValues[i] = value
+        }
 
-				cellValues[i] = value
 			}
 
 			cell, _ := excelize.CoordinatesToCellName(1, rowIndex)
