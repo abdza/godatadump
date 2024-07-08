@@ -186,7 +186,7 @@ func processTask(db *sql.DB, task DumpTask) error {
 	}
 
 	// Validate columns against tracker_field table and get field types
-	validColumns, fieldTypes, err := validateColumnsAndGetTypes(db, trackerId, columnsToExport)
+	validColumns, fieldTypes, fieldLabels, err := validateColumnsAndGetTypes(db, trackerId, columnsToExport)
 	if err != nil {
 		return fmt.Errorf("error validating columns for table '%s': %v", tableName, err)
 	}
@@ -201,7 +201,7 @@ func processTask(db *sql.DB, task DumpTask) error {
 
 	// Dump data to Excel
 	fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, task.TrackerModule, task.TrackerSlug); err != nil {
+	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug); err != nil {
 		return fmt.Errorf("error dumping data to Excel for table '%s': %v", tableName, err)
 	}
 
@@ -224,23 +224,26 @@ func tableExists(db *sql.DB, tableName string) bool {
 	return count > 0
 }
 
-func validateColumnsAndGetTypes(db *sql.DB, trackerId int, columns []string) ([]string, map[string]string, error) {
+func validateColumnsAndGetTypes(db *sql.DB, trackerId int, columns []string) ([]string, map[string]string, map[string]string, error) {
 	var validColumns []string
 	fieldTypes := make(map[string]string)
+	fieldLabels := make(map[string]string)
 	for _, col := range columns {
 		col = strings.TrimSpace(col)
 		var count int
 		var fieldType string
-		err := db.QueryRow("SELECT COUNT(*), field_type FROM tracker_field WHERE tracker_id = ? AND name = ? GROUP BY field_type", trackerId, col).Scan(&count, &fieldType)
+		var fieldLabel string
+		err := db.QueryRow("SELECT COUNT(*), field_type, label FROM tracker_field WHERE tracker_id = ? AND name = ? GROUP BY field_type, label", trackerId, col).Scan(&count, &fieldType, &fieldLabel)
 		if err != nil && err != sql.ErrNoRows {
-			return nil, nil, fmt.Errorf("error validating column %s: %v", col, err)
+			return nil, nil, nil, fmt.Errorf("error validating column %s: %v", col, err)
 		}
 		if count > 0 {
 			validColumns = append(validColumns, col)
 			fieldTypes[col] = fieldType
+			fieldLabels[col] = fieldLabel
 		}
 	}
-	return validColumns, fieldTypes, nil
+	return validColumns, fieldTypes, fieldLabels, nil
 }
 
 func getExcelColumnName(index int) string {
@@ -253,7 +256,7 @@ func getExcelColumnName(index int) string {
 	return columnName
 }
 
-func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, module, slug string) error {
+func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug string) error {
 	// Create a new Excel file
 	f := excelize.NewFile()
 	defer f.Close()
@@ -275,7 +278,7 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 	fmt.Println("Processing header rows...")
 	headerRow := make([]interface{}, len(columns))
 	for i, col := range columns {
-		headerRow[i] = col
+		headerRow[i] = fieldLabels[col]
 	}
 	if err := streamWriter.SetRow("A1", headerRow); err != nil {
 		return fmt.Errorf("error writing header row: %v", err)
