@@ -27,6 +27,7 @@ type DumpTask struct {
   TargetFile    string
   TableLimit    sql.NullInt64
 	TableSort     sql.NullString
+  TableCond     sql.NullString
 }
 
 func main() {
@@ -85,12 +86,12 @@ func main() {
 
   // Prepare the query based on whether a specific datadump_id was provided
 	var rows *sql.Rows
-	if *datadumpID > 0 {
+  if *datadumpID > 0 {
 		fmt.Printf("Processing specific datadump ID: %d\n", *datadumpID)
-		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file, table_limit, table_sort FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file, table_limit, table_sort, table_cond FROM trak_data_dumper_data WHERE id = ?", *datadumpID)
 	} else {
 		fmt.Println("Processing all datadump records...")
-		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file, table_limit, table_sort FROM trak_data_dumper_data")
+		rows, err = db.Query("SELECT id, tracker_module, tracker_slug, target_file, table_limit, table_sort, table_cond FROM trak_data_dumper_data")
 	}
 
 	if err != nil {
@@ -99,9 +100,9 @@ func main() {
 	defer rows.Close()
 
 	// Enqueue tasks
-	for rows.Next() {
+  for rows.Next() {
 		var task DumpTask
-		err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug, &task.TargetFile, &task.TableLimit, &task.TableSort)
+		err := rows.Scan(&task.DatadumpID, &task.TrackerModule, &task.TrackerSlug, &task.TargetFile, &task.TableLimit, &task.TableSort, &task.TableCond)
 		if err != nil {
 			log.Printf("Error scanning row: %v\n", err)
 			continue
@@ -212,7 +213,7 @@ func processTask(db *sql.DB, task DumpTask) error {
 
 	// Dump data to Excel
   fmt.Printf("Dumping data from table '%s' to Excel...\n", tableName)
-	if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug, task.TargetFile, task.TableLimit, task.TableSort); err != nil {
+  if err := dumpToExcel(db, tableName, trackerId, validColumns, fieldTypes, fieldLabels, task.TrackerModule, task.TrackerSlug, task.TargetFile, task.TableLimit, task.TableSort, task.TableCond); err != nil {
 		return fmt.Errorf("error dumping data to Excel for table '%s': %v", tableName, err)
 	}
 
@@ -302,7 +303,7 @@ func processUserBranchField(value interface{}, stmt *sql.Stmt) interface{} {
 	return fmt.Sprintf("%v", id)
 }
 
-func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string, tableLimit sql.NullInt64, tableSort sql.NullString) error {
+func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string, tableLimit sql.NullInt64, tableSort sql.NullString, tableCond sql.NullString) error {
 
 	// Create a new Excel file
 	f := excelize.NewFile()
@@ -347,6 +348,11 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 
   // Prepare the query with OFFSET, FETCH, and optional ORDER BY and LIMIT
 	baseQuery := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
+
+  // Add WHERE clause if tableCond is provided
+	if tableCond.Valid && tableCond.String != "" {
+		baseQuery += " WHERE " + tableCond.String
+	}
 
   // Add ORDER BY clause if tableSort is provided
 	if tableSort.Valid && tableSort.String != "" {
