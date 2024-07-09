@@ -361,17 +361,25 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 	offset := 0
 	rowIndex := 2
 	totalRowsProcessed := 0
+  var effectiveLimit int64
+
+	// Determine if we should apply a limit
+	if tableLimit.Valid && tableLimit.Int64 > 0 {
+		effectiveLimit = tableLimit.Int64
+	} else {
+		effectiveLimit = -1 // No limit
+	}
 
   for {
 		// Determine the number of rows to fetch in this batch
-		rowsToFetch := batchSize
-		if tableLimit.Valid {
-			remainingRows := int(tableLimit.Int64) - totalRowsProcessed
+    rowsToFetch := batchSize
+		if effectiveLimit > 0 {
+			remainingRows := effectiveLimit - int64(totalRowsProcessed)
 			if remainingRows <= 0 {
 				break // We've reached the table limit
 			}
-			if remainingRows < batchSize {
-				rowsToFetch = remainingRows
+			if remainingRows < int64(batchSize) {
+				rowsToFetch = int(remainingRows)
 			}
 		}
 
@@ -425,7 +433,7 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 			totalRowsProcessed++
 
 			// Check if we've reached the table limit
-			if tableLimit.Valid && totalRowsProcessed >= int(tableLimit.Int64) {
+      if effectiveLimit > 0 && int64(totalRowsProcessed) >= effectiveLimit {
 				rows.Close()
 				break
 			}
