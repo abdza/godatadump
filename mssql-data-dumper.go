@@ -307,14 +307,33 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 
 	// Create a new Excel file
 	f := excelize.NewFile()
-	defer f.Close()
+	defer func() {
+    if err := f.Close(); err != nil {
+      log.Printf("Error closing Excel file: %v", err)
+    }
+  }()
 
 	// Create a new sheet
-	sheetName := "Sheet1"
+	sheetName := "Data"
 	_, err := f.NewSheet(sheetName)
 	if err != nil {
 		return fmt.Errorf("error creating new sheet: %v", err)
 	}
+
+	// Remove the default sheet
+	defaultSheet := f.GetSheetName(0)
+	if defaultSheet != sheetName {
+		if err := f.DeleteSheet(defaultSheet); err != nil {
+			return fmt.Errorf("error deleting default sheet: %v", err)
+		}
+	}
+
+  // Set the active sheet
+  index, err := f.GetSheetIndex(sheetName)
+  if err != nil {
+		return fmt.Errorf("error getting sheet index: %v", err)
+	}
+	f.SetActiveSheet(index)
 
 	// Create a streaming writer
 	streamWriter, err := f.NewStreamWriter(sheetName)
