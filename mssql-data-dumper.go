@@ -472,11 +472,11 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 		offset += rowsProcessed
 
 		// Flush the stream writer periodically to save memory
-		if offset%50000 == 0 {
+		/* if offset%100000 == 0 {
 			if err := streamWriter.Flush(); err != nil {
 				return fmt.Errorf("error flushing stream writer: %v", err)
 			}
-		}
+		} */
 	}
 
 	// Final flush of the stream writer
