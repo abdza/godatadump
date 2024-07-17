@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"math"
+  "strconv"
 
 	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/xuri/excelize/v2"
@@ -303,6 +305,46 @@ func processUserBranchField(value interface{}, stmt *sql.Stmt) interface{} {
 	return fmt.Sprintf("%v", id)
 }
 
+func formatDate(value interface{}) interface{} {
+	if value == nil {
+		return ""
+	}
+
+	switch v := value.(type) {
+	case time.Time:
+		return v.Format("02/01/2006") // Format as dd/mm/yyyy
+	case string:
+		if t, err := time.Parse("2006-01-02T15:04:05Z", v); err == nil {
+			return t.Format("02/01/2006")
+		}
+		return v // Return original value if parsing fails
+	default:
+		return fmt.Sprintf("%v", value)
+	}
+}
+
+func formatInteger(value interface{}) interface{} {
+	if value == nil {
+		return ""
+	}
+
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return v
+	case float64:
+		return int(math.Round(v))
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return int(math.Round(f))
+		}
+		return v // Return original value if parsing fails
+	default:
+		return fmt.Sprintf("%v", value)
+	}
+}
+
 func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string, tableLimit sql.NullInt64, tableSort sql.NullString, tableCond sql.NullString) error {
 
 	// Create a new Excel file
@@ -435,15 +477,18 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 			for i, col := range columns {
 				value := rowData[i]
 
-				// Handle User and Branch field types
         switch fieldTypes[col] {
-        case "User":
-          cellValues[i] = processUserBranchField(value, userStmt)
-        case "Branch":
-          cellValues[i] = processUserBranchField(value, branchStmt)
-        default:
-          cellValues[i] = value
-        }
+				case "User":
+					cellValues[i] = processUserBranchField(value, userStmt)
+				case "Branch":
+					cellValues[i] = processUserBranchField(value, branchStmt)
+				case "Date":
+					cellValues[i] = formatDate(value)
+				case "Integer":
+					cellValues[i] = formatInteger(value)
+				default:
+					cellValues[i] = value
+				}
 
 			}
 
