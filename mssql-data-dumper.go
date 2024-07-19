@@ -312,10 +312,10 @@ func formatDate(value interface{}) interface{} {
 
 	switch v := value.(type) {
 	case time.Time:
-		return v.Format("02/01/2006") // Format as dd/mm/yyyy
+		return v.Format("2006-01-02") // Format as dd/mm/yyyy
 	case string:
 		if t, err := time.Parse("2006-01-02T15:04:05Z", v); err == nil {
-			return t.Format("02/01/2006")
+			return t.Format("2006-01-02")
 		}
 		return v // Return original value if parsing fails
 	default:
