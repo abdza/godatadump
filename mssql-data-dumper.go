@@ -323,7 +323,7 @@ func formatDate(value interface{}) interface{} {
 	}
 }
 
-func formatInteger(value interface{}) interface{} {
+func formatInteger(columnName string, value interface{}) interface{} {
 	if value == nil {
 		return ""
 	}
@@ -336,13 +336,24 @@ func formatInteger(value interface{}) interface{} {
 	case float64:
 		return int(math.Round(v))
 	case string:
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return int(math.Round(f))
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		} else {
+			fmt.Printf("Error converting string to integer for column '%s': %v. Original value: %v\n", columnName, err, v)
 		}
-		return v // Return original value if parsing fails
+	case []uint8:
+		str := string(v)
+		if i, err := strconv.Atoi(str); err == nil {
+			return i
+		} else {
+			fmt.Printf("Error converting []uint8 to integer for column '%s': %v. Original value: %v\n", columnName, err, str)
+		}
 	default:
-		return fmt.Sprintf("%v", value)
+		fmt.Printf("Unexpected type for integer field '%s': %T. Value: %v\n", columnName, v, v)
 	}
+
+	// If all conversions fail, return the original value as a string
+	return fmt.Sprintf("%v", value)
 }
 
 func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, fieldTypes map[string]string, fieldLabels map[string]string, module, slug, targetFile string, tableLimit sql.NullInt64, tableSort sql.NullString, tableCond sql.NullString) error {
@@ -485,7 +496,10 @@ func dumpToExcel(db *sql.DB, tableName string, trackerId int, columns []string, 
 				case "Date":
 					cellValues[i] = formatDate(value)
 				case "Integer":
-					cellValues[i] = formatInteger(value)
+					cellValues[i] = formatInteger(col,value)
+					if cellValues[i] == value && value != nil {
+						log.Printf("Error processing Integer field '%s'. Original value: %v", col, value)
+					}
 				default:
 					cellValues[i] = value
 				}
